@@ -1,0 +1,3 @@
+Nuclear Safety Manual.
+
+The primary coolant system is responsible for regulating the core temperature. Operators must ensure the valves remain open during Phase 1 operations. Failure to do so will trigger an immediate shutdown sequence.

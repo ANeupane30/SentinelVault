@@ -1,0 +1,16 @@
+{
+    "file_info": {
+        "file_name": "sample_document.txt",
+        "engine": "text_fallback"
+    },
+    "classification": {
+        "domain": "ConnectionError",
+        "doc_type": "ConnectionError",
+        "suggested_schema": []
+    },
+    "triples": [],
+    "database_exports": {
+        "neo4j_cypher": [],
+        "vector_db_json": []
+    }
+}
