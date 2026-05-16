@@ -48,13 +48,14 @@ class RerankerService:
             await self.initialize_models()
 
         logger.info(f"Cross-encoder reranking {len(candidates)} mixed candidates...")
-        
+
         # Prepare pairs for the cross-encoder: [[query, doc1], [query, doc2], ...]
         pairs = [[query, str(cand.get("content", ""))] for cand in candidates]
-        
-        # Real cross-encoder scoring
-        scores = self.reranker_model.compute_score(pairs)
-        if isinstance(scores, float): # If only 1 pair, it returns a single float
+
+        # compute_score is CPU/GPU-bound and synchronous — offload to the thread-pool
+        # executor so the async event loop is not blocked while scoring runs.
+        scores = await asyncio.to_thread(self.reranker_model.compute_score, pairs)
+        if isinstance(scores, float):  # single pair returns a bare float, not a list
             scores = [scores]
         
         ranked_results = []

@@ -11,12 +11,15 @@ LocalLLMClient — no Qwen/AWQ model weights are loaded in this process.
 """
 
 import os
+import uuid
 import logging
 from typing import List, Optional, Dict, Any
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, status
+from fastapi import Depends, FastAPI, Header, Request, UploadFile, File, HTTPException, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from loguru import logger
 import torch
 
 from llm_client import LocalLLMClient
@@ -28,15 +31,40 @@ from query_planner import QueryPlanner
 from reranker_service import RerankerService
 from audit_logger import AuditLogger
 
-# Configure structured logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+# ---------------------------------------------------------------------------
+# Logging — loguru replaces stdlib logging for structured, contextualised output.
+# The correlation ID is injected per-request via contextualize() in the middleware.
+# ---------------------------------------------------------------------------
+import sys
+logger.remove()  # Remove loguru's default handler
+# Provide a default value for correlation_id so startup/shutdown log lines
+# (which run outside any request context) do not raise a KeyError on the format field.
+logger.configure(extra={"correlation_id": "-"})
+logger.add(
+    sys.stderr,
+    level="INFO",
+    format=(
+        "<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | "
+        "<level>{level: <8}</level> | "
+        "<cyan>{name}</cyan>:<cyan>{line}</cyan> | "
+        "<yellow>corr_id={extra[correlation_id]}</yellow> | "
+        "{message}"
+    ),
 )
-logger = logging.getLogger("SentinelVault-API")
 
 # Minimum VRAM required for BGE-M3 + BGE-Reranker (LLM runs in Docker Desktop, not here)
 MIN_VRAM_GB = float(os.getenv("MIN_VRAM_GB", "4"))
+
+# When REQUIRE_GPU=false the service starts in CPU-only mode (degraded throughput).
+# Leave REQUIRE_GPU unset or set to any other value to keep the original fail-fast behaviour.
+_REQUIRE_GPU = os.getenv("REQUIRE_GPU", "true").strip().lower() != "false"
+
+# ---------------------------------------------------------------------------
+# Service-to-service API key
+# Read once at module load so misconfiguration is caught before any request.
+# Set RAG_API_KEY in the environment (or .env) before starting the server.
+# ---------------------------------------------------------------------------
+_RAG_API_KEY: str | None = os.getenv("RAG_API_KEY")
 
 
 @asynccontextmanager
@@ -57,21 +85,35 @@ async def lifespan(app: FastAPI):
     logger.info("=== SentinelVault startup ===")
 
     # 1. Hardware validation
+    # When REQUIRE_GPU=false: warn and continue in CPU-only mode.
+    # Otherwise: crash fast so GPU misconfigurations are caught immediately.
     if not torch.cuda.is_available():
-        raise RuntimeError(
-            "FATAL: CUDA is not available. SentinelVault requires a compatible NVIDIA GPU "
-            "for BGE-M3 embeddings and reranking."
+        if _REQUIRE_GPU:
+            raise RuntimeError(
+                "FATAL: CUDA is not available. SentinelVault requires a compatible NVIDIA GPU "
+                "for BGE-M3 embeddings and reranking. "
+                "Set REQUIRE_GPU=false to start in CPU-only mode (degraded throughput)."
+            )
+        logger.warning(
+            "CUDA is not available — running in CPU-only mode (REQUIRE_GPU=false). "
+            "Throughput will be significantly lower than GPU operation."
         )
-
-    free_mem, total_mem = torch.cuda.mem_get_info()
-    total_gb = total_mem / 1024 ** 3
-    if total_gb < MIN_VRAM_GB:
-        raise RuntimeError(
-            f"FATAL: Insufficient VRAM. Found {total_gb:.1f} GB, "
-            f"minimum {MIN_VRAM_GB} GB required (BGE-M3 + Reranker). "
-            "Set MIN_VRAM_GB env var to override."
-        )
-    logger.info(f"Hardware validation passed ({total_gb:.1f} GB VRAM available).")
+    else:
+        free_mem, total_mem = torch.cuda.mem_get_info()
+        total_gb = total_mem / 1024 ** 3
+        if total_gb < MIN_VRAM_GB:
+            if _REQUIRE_GPU:
+                raise RuntimeError(
+                    f"FATAL: Insufficient VRAM. Found {total_gb:.1f} GB, "
+                    f"minimum {MIN_VRAM_GB} GB required (BGE-M3 + Reranker). "
+                    "Set MIN_VRAM_GB env var to override, or set REQUIRE_GPU=false for CPU-only mode."
+                )
+            logger.warning(
+                f"Insufficient VRAM ({total_gb:.1f} GB < {MIN_VRAM_GB} GB) — "
+                "continuing in CPU-only mode (REQUIRE_GPU=false)."
+            )
+        else:
+            logger.info(f"Hardware validation passed ({total_gb:.1f} GB VRAM available).")
 
     # 2. LLM Client — connects to Docker Desktop; no GPU memory consumed in this process
     llm_client = LocalLLMClient()
@@ -127,6 +169,86 @@ app = FastAPI(
 
 
 # ---------------------------------------------------------------------------
+# Feature 1 — Correlation ID middleware
+#
+# For every request:
+#   1. Read X-Correlation-ID header; generate a uuid4 if absent.
+#   2. Bind it to loguru's context so every log line in this request carries it.
+#   3. Store it on request.state so route handlers can read it if needed.
+#   4. Echo it back in the response header.
+# ---------------------------------------------------------------------------
+
+@app.middleware("http")
+async def correlation_id_middleware(request: Request, call_next):
+    correlation_id = request.headers.get("X-Correlation-ID") or str(uuid.uuid4())
+    request.state.correlation_id = correlation_id
+
+    # Bind to loguru context for the duration of this request.
+    with logger.contextualize(correlation_id=correlation_id):
+        response = await call_next(request)
+
+    response.headers["X-Correlation-ID"] = correlation_id
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Feature 2 — Service-to-service API key dependency
+#
+# Applied only to /v1/ingest and /v1/query (the .NET-facing routes).
+# All other routes (/query, /ingest, /feedback, /health) remain open.
+# ---------------------------------------------------------------------------
+
+async def verify_api_key(x_api_key: str = Header(
+    default=None,
+    alias="X-Api-Key",
+    description="Shared secret sent by the .NET backend on every /v1/* call.",
+)):
+    """
+    FastAPI dependency that enforces the RAG_API_KEY shared secret.
+    Raises HTTP 401 if the header is missing or does not match.
+    """
+    if not _RAG_API_KEY:
+        # Key not configured — skip enforcement so local dev still works,
+        # but emit a clear warning so it is not silently skipped in prod.
+        logger.warning(
+            "RAG_API_KEY is not set. /v1/* routes are running WITHOUT authentication. "
+            "Set RAG_API_KEY in the environment before deploying to production."
+        )
+        return
+    if x_api_key != _RAG_API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or missing X-Api-Key header.",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Feature 3 — Global exception handler
+#
+# Catches any unhandled Exception that escapes a route handler.
+# Logs it with full traceback and returns a structured JSON 500 response
+# that includes the correlation ID for cross-service tracing.
+# ---------------------------------------------------------------------------
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    correlation_id = getattr(request.state, "correlation_id", "unknown")
+    logger.error(
+        f"Unhandled exception on {request.method} {request.url.path} "
+        f"[corr_id={correlation_id}]: {exc}",
+        exc_info=True,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": type(exc).__name__,
+            "message": str(exc),
+            "correlation_id": correlation_id,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # Pydantic Data Contracts
 # ---------------------------------------------------------------------------
 
@@ -168,6 +290,16 @@ class FeedbackResponse(BaseModel):
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
+
+@app.get("/health", tags=["ops"])
+async def health_check():
+    """
+    Liveness probe — returns immediately without touching any ML model or database.
+    Used by Docker Compose healthchecks and the .NET backend's readiness check.
+    """
+    return {"status": "ok", "version": "2.1.0"}
+
 
 @app.post("/ingest", response_model=IngestResponse, status_code=status.HTTP_202_ACCEPTED)
 async def ingest_document(file: UploadFile = File(...)):
@@ -317,3 +449,53 @@ async def submit_feedback(request: FeedbackRequest):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Feedback error: {str(e)}",
         )
+
+
+# ---------------------------------------------------------------------------
+# /v1/* aliases — used by the .NET PythonAiClient
+#
+# These thin wrappers delegate to the canonical handlers above so there is
+# no duplicated logic.  The .NET backend strips auth, then forwards here.
+# ---------------------------------------------------------------------------
+
+
+class V1QueryRequest(BaseModel):
+    """Slim request accepted by the .NET-facing /v1/query alias."""
+    query: str = Field(..., description="Natural language query string")
+
+
+@app.post(
+    "/v1/ingest",
+    response_model=IngestResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["v1-aliases"],
+    dependencies=[Depends(verify_api_key)],
+)
+async def v1_ingest_document(file: UploadFile = File(...)):
+    """
+    .NET-compatible alias for POST /ingest.
+    Accepts multipart/form-data with a 'file' field and delegates to the
+    canonical ingest_document handler — no logic is duplicated here.
+    Protected by X-Api-Key header (verify_api_key dependency).
+    """
+    return await ingest_document(file)
+
+
+@app.post(
+    "/v1/query",
+    tags=["v1-aliases"],
+    dependencies=[Depends(verify_api_key)],
+)
+async def v1_query_pipeline(request: V1QueryRequest):
+    """
+    .NET-compatible alias for POST /query.
+    Accepts { "query": "..." } and returns a plain string (the answer field only)
+    so the .NET ChatService can treat it as a raw string without deserialising
+    the full QueryResponse envelope.
+    Protected by X-Api-Key header (verify_api_key dependency).
+    """
+    # Build a full QueryRequest with no filters and delegate to the canonical handler.
+    full_request = QueryRequest(query=request.query, filters=None)
+    result: QueryResponse = await query_pipeline(full_request)
+    # Return only the answer string — matches what .NET PythonAiClient.GetAiResponseAsync expects.
+    return result.answer

@@ -1,0 +1,94 @@
+# =============================================================================
+# .dockerignore — RAG/
+#
+# Keeps the build context lean by excluding files that should never land
+# inside the container image.  Smaller context = faster `docker build` and
+# less accidental secret leakage.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Python runtime artefacts
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]           # .pyc, .pyo, .pyd
+*.pyo
+*.pyd
+.Python
+*.so
+
+# ---------------------------------------------------------------------------
+# Virtual environments (dependencies come from requirements.txt, not the venv)
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+
+# ---------------------------------------------------------------------------
+# Secrets & local config
+# .env is mounted at runtime via the docker-compose volume, not baked in.
+# Baking it in would leak credentials into the image layer history.
+# ---------------------------------------------------------------------------
+.env
+*.env
+.env.*
+
+# ---------------------------------------------------------------------------
+# HuggingFace / model weight caches
+# Model weights are downloaded at first boot into the hf_cache named volume.
+# Including them here would balloon the build context by several gigabytes.
+# ---------------------------------------------------------------------------
+.cache/
+__model_cache__/
+
+# ---------------------------------------------------------------------------
+# Runtime-generated artefacts
+# ---------------------------------------------------------------------------
+correction_ledger.jsonl     # append-only ledger written at runtime
+*.log
+*.jsonl
+
+# ---------------------------------------------------------------------------
+# Documentation & dev-only files (not needed inside the container)
+# ---------------------------------------------------------------------------
+*.md
+ARCHITECTURE.md
+setup.md
+
+# ---------------------------------------------------------------------------
+# Test / sample data files
+# ---------------------------------------------------------------------------
+dummy_resume.txt
+sample_document.txt
+final_manifest.json
+
+# ---------------------------------------------------------------------------
+# Docker files themselves (no need to copy into the image)
+# ---------------------------------------------------------------------------
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# ---------------------------------------------------------------------------
+# IDE & OS metadata
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ---------------------------------------------------------------------------
+# Git
+# ---------------------------------------------------------------------------
+.git/
+.gitignore
+.gitattributes
+
+# ---------------------------------------------------------------------------
+# pytest / coverage
+# ---------------------------------------------------------------------------
+.pytest_cache/
+.coverage
+htmlcov/
