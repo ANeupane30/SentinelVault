@@ -1,4 +1,8 @@
 <Solution>
+  <Folder Name="/Docker/">
+    <File Path=".dockerignore" />
+    <File Path="DockerFile.txt" />
+  </Folder>
   <Project Path="SentinelVault.Api/SentinelVault.Api.csproj" />
   <Project Path="SentinelVault.Application/SentinelVault.Application.csproj" />
   <Project Path="SentinelVault.Domain/SentinelVault.Domain.csproj" />

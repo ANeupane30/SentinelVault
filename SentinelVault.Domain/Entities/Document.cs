@@ -1,16 +1,16 @@
 ﻿using System;
-using System.Collections.Generic;
-using System.Text;
+using SentinelVault.Domain.Enums;
 
 namespace SentinelVault.Domain.Entities
 {
     public class Document
     {
-        public Guid Id { get; init; } = Guid.NewGuid();
+        public Guid Id { get; set; } = Guid.NewGuid();
         public string FileName { get; set; } = string.Empty;
         public string FilePath { get; set; } = string.Empty;
         public Guid UserId { get; set; }
-        public DateTime UploadedAt { get; init; } = DateTime.UtcNow;
-        public string Status { get; set; } = "Pending";
+        public DateTime CreatedDate { get; set; }
+        public DateTime UploadedAt { get; set; }
+        public DocumentStatus Status { get; set; } = DocumentStatus.Pending;
     }
 }
