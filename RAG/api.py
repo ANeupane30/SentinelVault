@@ -1,130 +1,319 @@
+"""
+api.py
+
+FastAPI entry point for SentinelVault.
+Manages HTTP endpoints for ingestion and query execution, routing requests
+to the local-first components (Docling, GLiNER, BGE-M3, Neo4j, Qdrant)
+and communicating with the .NET 10 core service via gRPC (notification stub deferred).
+
+LLM inference is handled by the Docker Desktop model (llama3.2:3B-Q4_K_M) via
+LocalLLMClient — no Qwen/AWQ model weights are loaded in this process.
+"""
+
 import os
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ValidationError
+import logging
+from typing import List, Optional, Dict, Any
+from contextlib import asynccontextmanager
 
-# Pipeline Imports
-from document_parser import UniversalParser, DoclingParserError
-from domain_classifier import detect_document_context
-from dynamic_extractor import ZeroShotExtractor
-from graph_formatter import GraphFormatter
-from retrieval_service import HybridRetrievalService, RRFMergeError
+from fastapi import FastAPI, UploadFile, File, HTTPException, status
+from pydantic import BaseModel, Field
+import torch
+
+from llm_client import LocalLLMClient
+from document_parser import DocumentParser
+from logic_extractor import LogicExtractor
+from entity_resolver import EntityResolver
 from database_service import DatabaseService
+from query_planner import QueryPlanner
+from reranker_service import RerankerService
+from audit_logger import AuditLogger
 
-app = FastAPI(title="SecureVault API", description="Zero-Shot Extraction & Hybrid Retrieval Engine")
+# Configure structured logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("SentinelVault-API")
 
-# --- Global Exception Handlers for Strict Fail-Fast ---
+# Minimum VRAM required for BGE-M3 + BGE-Reranker (LLM runs in Docker Desktop, not here)
+MIN_VRAM_GB = float(os.getenv("MIN_VRAM_GB", "4"))
 
-@app.exception_handler(DoclingParserError)
-async def docling_parser_error_handler(request: Request, exc: DoclingParserError):
-    return JSONResponse(
-        status_code=400,
-        content={"error": "DoclingParserError", "detail": str(exc)}
-    )
 
-@app.exception_handler(ValidationError)
-async def pydantic_validation_error_handler(request: Request, exc: ValidationError):
-    return JSONResponse(
-        status_code=422,
-        content={"error": "ValidationError", "detail": exc.errors()}
-    )
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Application startup and shutdown lifecycle.
 
-@app.exception_handler(RRFMergeError)
-async def rrf_merge_error_handler(request: Request, exc: RRFMergeError):
-    return JSONResponse(
-        status_code=422,
-        content={"error": "RRFMergeError", "detail": str(exc)}
-    )
+    Startup sequence (order matters):
+      1. Hardware validation
+      2. LLM client (connects to Docker Desktop — no GPU memory used here)
+      3. EntityResolver → loads BGE-M3 (shared)
+      4. LogicExtractor → loads GLiNER on CPU
+      5. DatabaseService → reuses BGE-M3 from EntityResolver
+      6. QueryPlanner, RerankerService → model-free or GPU-light
+      7. Database connections (Neo4j + Qdrant)
+      8. AuditLogger → injected with DatabaseService
+    """
+    logger.info("=== SentinelVault startup ===")
 
-@app.exception_handler(ValueError)
-async def value_error_handler(request: Request, exc: ValueError):
-    return JSONResponse(
-        status_code=400,
-        content={"error": "ValueError", "detail": str(exc)}
-    )
+    # 1. Hardware validation
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            "FATAL: CUDA is not available. SentinelVault requires a compatible NVIDIA GPU "
+            "for BGE-M3 embeddings and reranking."
+        )
 
-@app.exception_handler(Exception)
-async def generic_exception_handler(request: Request, exc: Exception):
-    import traceback
-    return JSONResponse(
-        status_code=500,
-        content={
-            "error": "InternalServerError", 
-            "detail": str(exc),
-            "traceback": traceback.format_exc()
-        }
-    )
+    free_mem, total_mem = torch.cuda.mem_get_info()
+    total_gb = total_mem / 1024 ** 3
+    if total_gb < MIN_VRAM_GB:
+        raise RuntimeError(
+            f"FATAL: Insufficient VRAM. Found {total_gb:.1f} GB, "
+            f"minimum {MIN_VRAM_GB} GB required (BGE-M3 + Reranker). "
+            "Set MIN_VRAM_GB env var to override."
+        )
+    logger.info(f"Hardware validation passed ({total_gb:.1f} GB VRAM available).")
 
-# --- Endpoints ---
+    # 2. LLM Client — connects to Docker Desktop; no GPU memory consumed in this process
+    llm_client = LocalLLMClient()
+    app.state.llm_client = llm_client
+
+    # 3. Entity Resolver → loads BGE-M3 (will be shared)
+    entity_resolver = EntityResolver()
+    await entity_resolver.initialize_models()
+    app.state.entity_resolver = entity_resolver
+
+    # 4. Logic Extractor → loads GLiNER on CPU; receives shared LLM client
+    logic_extractor = LogicExtractor(llm_client=llm_client)
+    await logic_extractor.initialize_models()
+    app.state.logic_extractor = logic_extractor
+
+    # 5. Database Service → reuses EntityResolver's BGE-M3 instance (saves ~2 GB VRAM)
+    database_service = DatabaseService()
+    await database_service.initialize_models(shared_model=entity_resolver.embedding_model)
+    await database_service.connect()
+    app.state.database_service = database_service
+
+    # 6. Query Planner → receives shared LLM client (no additional model load)
+    query_planner = QueryPlanner(llm_client=llm_client)
+    app.state.query_planner = query_planner
+
+    # 7. Reranker Service → loads BGE-Reranker-v2-m3
+    reranker_service = RerankerService()
+    await reranker_service.initialize_models()
+    app.state.reranker_service = reranker_service
+
+    # 8. Audit Logger → injected with DatabaseService for graph pruning
+    audit_logger = AuditLogger(db_service=database_service)
+    app.state.audit_logger = audit_logger
+
+    # Document Parser — no model weights, initialised last
+    document_parser = DocumentParser()
+    app.state.document_parser = document_parser
+
+    logger.info("=== SentinelVault ready ===")
+    yield
+
+    # Shutdown
+    logger.info("Shutting down SentinelVault services...")
+    await database_service.disconnect()
+
+
+app = FastAPI(
+    title="SentinelVault",
+    description="Local-First, High-Integrity Knowledge Orchestration Pipeline",
+    version="2.1.0",
+    lifespan=lifespan,
+)
+
+
+# ---------------------------------------------------------------------------
+# Pydantic Data Contracts
+# ---------------------------------------------------------------------------
 
 class QueryRequest(BaseModel):
-    query: str
+    query: str = Field(..., description="Natural language query string")
+    filters: Optional[Dict[str, Any]] = Field(
+        default=None, description="Optional metadata filters"
+    )
 
-@app.post("/ingest")
+
+class QueryResponse(BaseModel):
+    answer: str
+    confidence: float
+    sources: List[Dict[str, Any]]
+
+
+class IngestResponse(BaseModel):
+    status: str
+    document_id: str
+    extracted_entities: int
+    extracted_relations: int
+
+
+class FeedbackRequest(BaseModel):
+    query_id: str = Field(..., description="ID of the query this feedback relates to")
+    feedback_score: int = Field(
+        ..., description="Positive = good result, negative = bad result"
+    )
+    correction_signal: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional signal for targeted graph pruning, e.g. {'entity_name': 'Apple'}"
+    )
+
+
+class FeedbackResponse(BaseModel):
+    status: str
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/ingest", response_model=IngestResponse, status_code=status.HTTP_202_ACCEPTED)
 async def ingest_document(file: UploadFile = File(...)):
     """
-    Ingests a document, extracts zero-shot knowledge triples, and formats for databases.
+    Ingestion Pipeline:
+    File Upload → Docling → Character-Count Chunker →
+    [GLiNER + LLM Reasoning → Entity Resolver → Neo4j] +
+    [BGE-M3 → Qdrant] → Cross-link ChunkID → Correction Ledger
     """
-    temp_file_path = f"temp_{file.filename}"
+    logger.info(f"Received file for ingestion: {file.filename}")
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Filename missing.")
+
+    # Retrieve service instances from app state
+    document_parser: DocumentParser = app.state.document_parser
+    logic_extractor: LogicExtractor = app.state.logic_extractor
+    entity_resolver: EntityResolver = app.state.entity_resolver
+    database_service: DatabaseService = app.state.database_service
+    audit_logger: AuditLogger = app.state.audit_logger
+
     try:
-        # Save uploaded file temporarily for docling
-        with open(temp_file_path, "wb") as buffer:
-            buffer.write(await file.read())
-            
-        # 1. Parsing (Strict fail-fast)
-        parser = UniversalParser()
-        parsed_doc = parser.parse(temp_file_path)
-        full_text = parsed_doc["full_text"]
+        file_bytes = await file.read()
 
-        # 2. Classification
-        context = await detect_document_context(full_text)
-        suggested_schema = context.get("suggested_schema", [])
+        # 1. Document Parsing (Docling → multi-chunk sliding window)
+        document_id, parsed_chunks = await document_parser.parse(file.filename, file_bytes)
+        logger.info(f"Parsed document {document_id} into {len(parsed_chunks)} chunk(s).")
 
-        # 3. Extraction (Async Sliding Window + Slug Strategy)
-        extractor = ZeroShotExtractor()
-        triples = await extractor.sliding_window_extract(full_text, suggested_schema)
+        total_entities = 0
+        total_relations = 0
 
-        # 4. Graph Formatting
-        formatter = GraphFormatter()
-        cypher_queries = formatter.to_neo4j_cypher(triples)
-        vector_docs = formatter.to_vector_db_json(triples, metadata=context)
+        for chunk in parsed_chunks:
+            # 2. Logic Extraction (GLiNER + Docker Desktop LLM)
+            extraction_result = await logic_extractor.extract(chunk.text)
 
-        # 5. Push to Real Databases
-        db_service = DatabaseService()
-        try:
-            await db_service.initialize()
-            await db_service.push_to_neo4j(cypher_queries)
-            await db_service.push_to_qdrant(vector_docs)
-        finally:
-            await db_service.close()
+            # 3. Entity Resolution (Normalization → Blocking → BGE-M3 Semantic → Graph Context)
+            resolved_entities, resolved_relations = await entity_resolver.resolve(
+                extraction_result, database_service
+            )
 
-        return {
-            "status": "success",
-            "metadata": parsed_doc["metadata"],
-            "classification": context,
-            "extracted_triples_count": len(triples),
-            "databases_ready": {
-                "neo4j_queries_generated": len(cypher_queries),
-                "qdrant_docs_generated": len(vector_docs)
-            }
-        }
-    finally:
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
+            # 4. Upsert to Graph DB (Neo4j)
+            graph_ids = await database_service.upsert_graph(resolved_entities, resolved_relations)
 
-@app.post("/query")
-async def query_engine(req: QueryRequest):
+            # 5. Upsert to Vector DB (Qdrant) with BGE-M3
+            vector_id = await database_service.upsert_vector(chunk.text, chunk.metadata)
+
+            # 6. Cross-link ChunkID in Correction Ledger
+            await audit_logger.log_ingestion(
+                document_id=document_id,
+                chunk_id=vector_id,
+                graph_ids=graph_ids,
+                confidence=extraction_result.confidence,
+            )
+
+            total_entities += len(resolved_entities)
+            total_relations += len(resolved_relations)
+
+        # NOTE: gRPC notification to .NET core service is deferred (Fix 6).
+        # stub = sentinel_pb2_grpc.CoreServiceStub(grpc_channel)
+        # await stub.NotifyIngestionComplete(...)
+
+        return IngestResponse(
+            status="success",
+            document_id=document_id,
+            extracted_entities=total_entities,
+            extracted_relations=total_relations,
+        )
+
+    except Exception as e:
+        logger.error(f"Ingestion failed for '{file.filename}': {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Ingestion pipeline error: {str(e)}",
+        )
+
+
+@app.post("/query", response_model=QueryResponse)
+async def query_pipeline(request: QueryRequest):
     """
-    Executes a hybrid retrieval query using RRF.
+    Hybrid Retrieval Pipeline:
+    User Query → Query Intent Planner → SQI →
+    [Cypher Template → Neo4j] + [BGE-M3 → Qdrant] →
+    BGE-Reranker → LLM Synthesis → Correction Ledger
     """
-    service = HybridRetrievalService()
-    results = await service.query(req.query)
-    
-    return {
-        "status": "success",
-        "results": results
-    }
+    logger.info(f"Received query: {request.query}")
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    logic_extractor: LogicExtractor = app.state.logic_extractor
+    database_service: DatabaseService = app.state.database_service
+    query_planner: QueryPlanner = app.state.query_planner
+    reranker_service: RerankerService = app.state.reranker_service
+    audit_logger: AuditLogger = app.state.audit_logger
+
+    try:
+        # 1. Query Intent Planning (Docker Desktop LLM → SQI JSON → Cypher template)
+        sqi = await query_planner.generate_intent(request.query, request.filters)
+
+        # 2. Hybrid Retrieval
+        graph_results = await database_service.query_graph(sqi.cypher_template, sqi.parameters)
+        vector_results = await database_service.query_vector(request.query, limit=10)
+
+        # 3. Cross-Encoder Reranking (BGE-Reranker-v2-m3)
+        combined_candidates = graph_results + vector_results
+        ranked_results = await reranker_service.rerank(request.query, combined_candidates)
+
+        # 4. Final Answer Synthesis (Docker Desktop LLM)
+        final_answer = await logic_extractor.synthesize_answer(request.query, ranked_results)
+
+        # 5. Log to Correction Ledger
+        await audit_logger.log_query(request.query, sqi, ranked_results)
+
+        return QueryResponse(
+            answer=final_answer,
+            confidence=sqi.confidence,
+            sources=[res.dict() for res in ranked_results[:5]],
+        )
+
+    except Exception as e:
+        logger.error(f"Query pipeline failed: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Query execution error: {str(e)}",
+        )
+
+
+@app.post("/feedback", response_model=FeedbackResponse, status_code=status.HTTP_200_OK)
+async def submit_feedback(request: FeedbackRequest):
+    """
+    User Feedback Endpoint:
+    Logs feedback to the Correction Ledger.
+    Negative scores (< 0) trigger asynchronous graph pruning for the specified entity.
+
+    Example correction_signal: {"entity_name": "apple"}
+    """
+    audit_logger: AuditLogger = app.state.audit_logger
+
+    try:
+        await audit_logger.log_user_feedback(
+            query_id=request.query_id,
+            feedback_score=request.feedback_score,
+            correction_signal=request.correction_signal,
+        )
+        return FeedbackResponse(status="feedback recorded")
+
+    except Exception as e:
+        logger.error(f"Feedback submission failed: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Feedback error: {str(e)}",
+        )
