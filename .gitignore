@@ -3,3 +3,28 @@ __pycache__
 research
 RAG/.env
 RAG/fw_models.json
+
+# Visual Studio
+.vs/
+.vscode/
+*.user
+*.suo
+*.sln.iml
+bin/
+obj/
+*.cache
+
+# Build results
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+
+# NuGet
+*.nupkg
+*.snupkg
+.nuget/
+
+# Local environment
+appsettings.local.json
+.env.local

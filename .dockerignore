@@ -1,0 +1,6 @@
+**/.git
+**/.vs
+image/
+RAG/
+**/bin
+**/obj
