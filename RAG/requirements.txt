@@ -4,6 +4,7 @@ uvicorn==0.34.2
 pydantic==2.11.4
 python-dotenv==1.1.0
 python-multipart==0.0.20
+loguru==0.7.3
 
 # ── Databases ────────────────────────────────────────────────────────────────
 neo4j==5.28.1

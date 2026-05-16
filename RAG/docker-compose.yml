@@ -20,6 +20,9 @@ services:
       # Chunker
       - CHUNK_SIZE=1500
       - CHUNK_OVERLAP=150
+      # Service-to-service auth key — set RAG_API_KEY in the shell or a .env file.
+      # The .NET backend must send this value in the X-Api-Key header on every /v1/* call.
+      - RAG_API_KEY=${RAG_API_KEY}
     volumes:
       - ./.env:/app/.env
       - hf_cache:/root/.cache/huggingface
@@ -31,6 +34,15 @@ services:
     # host-gateway is silently ignored on Docker Desktop, so this is safe on all platforms.
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # Healthcheck — lets downstream services (e.g. the .NET API) declare
+    #   depends_on: sentinel_api: condition: service_healthy
+    # start_period is long (30 s) because model loading takes time on first boot.
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     deploy:
       resources:
         reservations:
