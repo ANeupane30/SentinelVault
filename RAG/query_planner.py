@@ -2,15 +2,17 @@
 query_planner.py
 
 Converts natural language queries into a Structured Query Intent (SQI) JSON object.
-Uses a shared LocalLLMClient (Docker Desktop llama3.2) to parse intent, capturing entities,
+Uses a shared LocalLLMClient (backed by OpenRouter) to parse intent, capturing entities,
 relationships, filters, and logical constraints. Maps these to pre-validated Cypher templates
 to prevent Cypher hallucinations.
 Enforces strict JSON parsing without fallback mock generation.
 """
 
+import os
 import logging
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
+from fastapi import HTTPException
 
 from llm_client import LocalLLMClient
 
@@ -24,7 +26,7 @@ class StructuredQueryIntent(BaseModel):
     filters: Dict[str, Any] = Field(default_factory=dict)
     cypher_template: str = Field(..., description="The pre-validated Cypher template string to use")
     parameters: Dict[str, Any] = Field(default_factory=dict)
-    confidence: float
+    confidence: Optional[float] = Field(default=None, description="Not currently calculated. Reserved for future use.")
 
 
 class QueryPlanner:
@@ -74,7 +76,7 @@ class QueryPlanner:
         """
         logger.info(f"Planning query intent for: '{user_query}'")
 
-        # Ultra-explicit prompt: small models (3B) need a concrete example and
+        # Explicit prompt: instruction-tuned models need a concrete output example and
         # must not be asked to produce keys that the code ignores anyway.
         messages = [
             {
@@ -102,6 +104,8 @@ class QueryPlanner:
         try:
             intent_data = await self.llm_client.complete_json(messages, max_tokens=128)
 
+            if isinstance(intent_data, list) and len(intent_data) > 0 and isinstance(intent_data[0], dict):
+                intent_data = intent_data[0]
             if isinstance(intent_data, dict):
                 intent_type = intent_data.get("intent_type", "ENTITY_LOOKUP")
                 target_entities = intent_data.get("target_entities", [])
@@ -112,18 +116,19 @@ class QueryPlanner:
                     "Defaulting to ENTITY_LOOKUP."
                 )
         except RuntimeError as e:
-            # complete_json() exhausted retries — fall back gracefully instead of 500.
-            logger.warning(
-                f"QueryPlanner LLM call failed after retries: {e}. "
-                "Falling back to full-text vector search (ENTITY_LOOKUP, no entity filter)."
+            logger.error(f"QueryPlanner LLM call failed after retries: {e}")
+            raise HTTPException(
+                status_code=502,
+                detail=f"Query planning failed due to upstream LLM error: {str(e)}"
             )
 
-        # Guard: fall back to ENTITY_LOOKUP if an unrecognised intent is returned
+        # Guard: explicitly reject unrecognized intent types
         if intent_type not in self.TEMPLATES:
-            logger.warning(
-                f"Unknown intent_type '{intent_type}' from LLM — defaulting to ENTITY_LOOKUP."
+            logger.warning(f"Unknown intent_type '{intent_type}' from LLM — rejecting query.")
+            raise HTTPException(
+                status_code=422,
+                detail={"message": "Query intent could not be parsed", "received": intent_type}
             )
-            intent_type = "ENTITY_LOOKUP"
 
         # Ensure list types are correct (LLM sometimes returns a bare string)
         if isinstance(target_entities, str):
@@ -132,9 +137,15 @@ class QueryPlanner:
             target_relations = [target_relations] if target_relations else []
 
         template = self.TEMPLATES[intent_type]
+
+        try:
+            graph_query_limit = int(os.getenv("GRAPH_QUERY_LIMIT", "50"))
+        except ValueError:
+            graph_query_limit = 50
+
         parameters: Dict[str, Any] = {
             "entity_names": target_entities,
-            "limit": 50,
+            "limit": graph_query_limit,
         }
 
         if intent_type == "PATH_FINDING" and len(target_entities) >= 2:
@@ -151,7 +162,6 @@ class QueryPlanner:
             filters=filters or {},
             cypher_template=template,
             parameters=parameters,
-            confidence=0.92,
         )
 
         logger.info(f"Generated SQI: {sqi.intent_type} targeting {sqi.target_entities}")

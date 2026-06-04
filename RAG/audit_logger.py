@@ -121,14 +121,11 @@ class AuditLogger:
 
     async def _write_to_ledger(self, entry: Dict[str, Any]):
         """
-        Asynchronously appends a JSONL entry to the ledger file.
-        File I/O is offloaded to a thread so the async event loop is not blocked.
+        Asynchronously appends a JSONL entry to the ledger file using aiofiles.
         """
-        def sync_write():
-            with open(LEDGER_PATH, 'a') as f:
-                f.write(json.dumps(entry) + '\n')
-
-        await asyncio.to_thread(sync_write)
+        import aiofiles
+        async with aiofiles.open(LEDGER_PATH, 'a') as f:
+            await f.write(json.dumps(entry) + '\n')
 
     async def _trigger_graph_refinement(self, correction_signal: Optional[Dict]):
         """

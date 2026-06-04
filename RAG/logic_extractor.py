@@ -1,22 +1,18 @@
 """
 logic_extractor.py
 
-Dual-layer extraction pipeline for SentinelVault.
-1. Uses GLiNER for fast zero-shot entity tagging on CPU.
-2. Uses a shared LocalLLMClient (Docker Desktop llama3.2) for implicit relationship reasoning.
+Extraction pipeline for SentinelVault.
+Uses a shared LocalLLMClient (backed by OpenRouter) for zero-shot entity tagging
+and implicit relationship reasoning.
 Outputs strictly validated Knowledge Triples via Pydantic. No fallback mock logic.
 """
 
-import logging
 import asyncio
 from typing import List, Any
 from pydantic import BaseModel, Field
-
-from gliner import GLiNER
+from loguru import logger
 
 from llm_client import LocalLLMClient
-
-logger = logging.getLogger("SentinelVault-LogicExtractor")
 
 
 class KnowledgeTriple(BaseModel):
@@ -38,45 +34,22 @@ class LogicExtractor:
         """
         Args:
             llm_client: Shared LocalLLMClient instance injected from api.py.
-                        Owns the Docker Desktop LLM connection — not loaded here.
+                        Owns the remote LLM connection — not loaded here.
         """
         self.llm_client = llm_client
-        self.gliner_model = None
-        self.models_loaded = False
-
-    async def initialize_models(self):
-        """
-        Loads GLiNER entity model on CPU.
-        The LLM is managed externally via LocalLLMClient — no model weights loaded here.
-        """
-        if self.models_loaded:
-            return
-
-        logger.info("Loading GLiNER entity model on CPU...")
-        self.gliner_model = GLiNER.from_pretrained("urchade/gliner_mediumv2.1").to("cpu")
-
-        self.models_loaded = True
-        logger.info("Logic Extractor (GLiNER) loaded successfully.")
 
     async def extract(self, text: str) -> ExtractionResult:
         """
-        Executes the dual-layer extraction pipeline.
+        Executes the extraction pipeline natively via the Cloud LLM.
         """
-        if not self.models_loaded:
-            logger.warning("Models not initialized, calling initialize_models() now.")
-            await self.initialize_models()
-
         logger.info(f"Extracting triples from text chunk ({len(text)} chars)...")
 
-        # Layer 1: GLiNER Entity Extraction & Heuristic Tagging
-        extracted_entities, base_triples = await self._run_gliner(text)
-
-        # Layer 2: LLM Logic Refinement (async, non-blocking via AsyncOpenAI)
+        # Layer 1 & 2 combined: LLM extracts entities and relations simultaneously
         try:
-            refined_triples = await self._run_llm_reasoning(text, extracted_entities, base_triples)
+            refined_triples = await self._run_llm_reasoning(text)
             llm_refined = True
         except Exception as e:
-            logger.error(f"Local LLM reasoning failed. Error: {str(e)}")
+            logger.error(f"Cloud LLM reasoning failed. Error: {str(e)}")
             raise RuntimeError(f"LLM Logic Extraction failed: {str(e)}")
 
         # Calculate overall confidence
@@ -90,71 +63,70 @@ class LogicExtractor:
             llm_refined=llm_refined
         )
 
-    async def _run_gliner(self, text: str) -> tuple[List[dict], List[KnowledgeTriple]]:
+    async def _run_llm_reasoning(self, text: str) -> List[KnowledgeTriple]:
         """
-        Runs GLiNER on CPU for entity extraction, applies strict mapping,
-        and formulates initial base triples heuristically.
-        """
-        labels = ["Company", "Product", "Person", "Location", "Support"]
-        entities = self.gliner_model.predict_entities(text, labels)
-
-        # Strict Mapping: Force known company names to be Company
-        for ent in entities:
-            if ent["text"].lower() in ["toshiba", "hp"]:
-                ent["label"] = "Company"
-
-        triples = []
-        # Heuristic: If there is exactly one Company and some Products, form HAS_PRODUCT triples
-        companies = [e for e in entities if e["label"] == "Company"]
-        products = [e for e in entities if e["label"] == "Product"]
-
-        if len(companies) == 1 and products:
-            for p in products:
-                triples.append(
-                    KnowledgeTriple(
-                        subject=companies[0]["text"],
-                        predicate="HAS_PRODUCT",
-                        object_=p["text"],
-                        confidence=0.5,  # Low confidence — awaits LLM refinement
-                        source_sentence=text
-                    )
-                )
-
-        return entities, triples
-
-    async def _run_llm_reasoning(
-        self, text: str, entities: List[dict], base_triples: List[KnowledgeTriple]
-    ) -> List[KnowledgeTriple]:
-        """
-        Uses the LocalLLMClient to infer implicit relations and long-range dependencies.
+        Uses the LocalLLMClient to extract entities and infer relations.
         Fully async — does not block the event loop.
         """
         messages = [
             {
                 "role": "user",
                 "content": (
-                    f"Given the text: '{text}'\n"
-                    f"Extracted Entities: {entities}\n"
-                    f"Base Heuristic Triples: {[t.dict(by_alias=True) for t in base_triples]}\n"
-                    "Extract any implicit relationships or correct any mistakes. "
-                    "Output a JSON array of triples, each with keys: "
-                    "subject, predicate, object, confidence (float 0-1), source_sentence."
+                    "Extract named entities and knowledge triples from this text.\n\n"
+                    f"TEXT:\n{text}\n\n"
+                    "Output ONLY a JSON object with two keys: 'entities' and 'triples'.\n"
+                    "'entities' must be an array of objects with 'text' and 'label' (e.g. Company, Product, Person).\n"
+                    "'triples' must be an array of objects with exactly these keys: subject, predicate, object, confidence.\n"
+                    "confidence is a float between 0 and 1. Use at most 5 words for subject and object values."
                 )
             }
         ]
 
-        extracted = await self.llm_client.complete_json(messages, max_tokens=512)
+        extracted = await self.llm_client.complete_json(messages, max_tokens=1000)
+        logger.info(f"Raw LLM Extraction Response:\n{extracted}")
 
-        # extracted may be a list of dicts or a dict with a triples key
+        # extracted should be a dict with 'entities' and 'triples' keys
+        triples_data = []
         if isinstance(extracted, dict):
-            extracted = extracted.get("triples", [])
+            triples_data = extracted.get("triples", [])
+        
+        refined = []
+        malformed_count = 0
+        total_count = len(triples_data)
 
-        refined = base_triples.copy()
-        for t in extracted:
+        for t in triples_data:
             try:
-                refined.append(KnowledgeTriple(**t))
+                if not isinstance(t, dict):
+                    logger.error(
+                        f"Non-dict triple item (type={type(t).__name__}): {t}"
+                    )
+                    malformed_count += 1
+                    continue
+                if not t.get("object"):
+                    logger.error(
+                        f"Triple with missing 'object' field: {t}"
+                    )
+                    malformed_count += 1
+                    continue
+                t["source_sentence"] = text[:150]
+                refined.append(KnowledgeTriple.model_validate(t))
             except Exception as e:
-                logger.warning(f"Skipping malformed triple from LLM output: {t} — {e}")
+                logger.error(
+                    f"Malformed triple from LLM output: {t} — {e}"
+                )
+                malformed_count += 1
+
+        # If more than 50% of triples are malformed, the LLM prompt adherence has failed
+        if total_count > 0 and malformed_count > (total_count / 2):
+            raise RuntimeError(
+                f"LLM prompt adherence failure: {malformed_count}/{total_count} "
+                f"triples were malformed in this chunk."
+            )
+        elif malformed_count > 0:
+            logger.warning(
+                f"{malformed_count}/{total_count} triples were malformed but "
+                f"below 50% threshold — partial extraction accepted."
+            )
 
         return refined
 

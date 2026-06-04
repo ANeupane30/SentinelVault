@@ -22,13 +22,12 @@ from docling.document_converter import DocumentConverter
 
 logger = logging.getLogger("SentinelVault-DocParser")
 
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1500"))
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "150"))
+# CHUNK_SIZE and CHUNK_OVERLAP are now validated in DocumentParser.__init__
 
 
 class ChunkMetadata(BaseModel):
     document_id: str
-    page_number: int
+    estimated_page_number: int
     heading_depth: int
     section_path: str
     source_filename: str
@@ -45,6 +44,15 @@ class DocumentParser:
         """
         Initialises the Docling universal parser.
         """
+        try:
+            self.chunk_size = int(os.getenv("CHUNK_SIZE", "1500"))
+            self.chunk_overlap = int(os.getenv("CHUNK_OVERLAP", "150"))
+        except ValueError as e:
+            raise RuntimeError(
+                f"CHUNK_SIZE and CHUNK_OVERLAP must be valid integers. "
+                f"Error: {e}"
+            ) from e
+
         logger.info("Initialising Docling DocumentParser...")
         self.converter = DocumentConverter()
 
@@ -77,7 +85,7 @@ class DocumentParser:
 
             logger.info(
                 f"Docling extracted {len(markdown_text)} chars from '{filename}'. "
-                f"Splitting into chunks (size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP})..."
+                f"Splitting into chunks (size={self.chunk_size}, overlap={self.chunk_overlap})..."
             )
 
             chunks = self._split_into_chunks(markdown_text, document_id, filename)
@@ -96,38 +104,40 @@ class DocumentParser:
         self, text: str, document_id: str, filename: str
     ) -> List[StructuredChunk]:
         """
-        Sliding-window character-count chunker.
-
-        Splits the full document text into overlapping chunks of CHUNK_SIZE characters,
-        stepping forward by (CHUNK_SIZE - CHUNK_OVERLAP) each iteration.
-        This ensures context is not lost at chunk boundaries.
+        Uses RecursiveCharacterTextSplitter to split the document text into chunks
+        respecting paragraph and sentence boundaries.
         """
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+        
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=self.chunk_size,
+            chunk_overlap=self.chunk_overlap
+        )
+        
+        text_chunks = splitter.split_text(text)
         chunks: List[StructuredChunk] = []
-        step = max(1, CHUNK_SIZE - CHUNK_OVERLAP)
-        start = 0
-
-        while start < len(text):
-            end = min(start + CHUNK_SIZE, len(text))
-            chunk_text = text[start:end].strip()
-
-            if chunk_text:  # Skip empty chunks that can appear at the tail
-                chunk_index = len(chunks) + 1
+        
+        for i, chunk_text in enumerate(text_chunks):
+            if chunk_text.strip():
+                chunk_index = i + 1
+                # Approximation: Docling's export_to_markdown() does not preserve
+                # native page boundaries, so we estimate page numbers using a
+                # heuristic of ~3000 characters per page. This is inaccurate for
+                # documents with dense tables, images, or sparse content.
+                estimated_page = max(1, ((i * (self.chunk_size - self.chunk_overlap)) // 3000) + 1)
                 chunks.append(
                     StructuredChunk(
                         chunk_id=str(uuid.uuid4()),
-                        text=chunk_text,
+                        text=chunk_text.strip(),
                         metadata=ChunkMetadata(
                             document_id=document_id,
-                            # Page estimation: rough heuristic — ~3000 chars per page
-                            page_number=max(1, (start // 3000) + 1),
+                            estimated_page_number=estimated_page,
                             heading_depth=1,
                             section_path=f"/chunk_{chunk_index}",
                             source_filename=filename,
                         ),
                     )
                 )
-
-            start += step
 
         return chunks
 

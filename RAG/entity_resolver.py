@@ -7,17 +7,19 @@ Prevents node duplication while preserving intentional disambiguation.
 Stages:
 1. Normalization  — string canonicalization (lowercase, strip punctuation)
 2. Blocking       — candidate pair generation (group by first character to avoid O(n²))
-3. Semantic Similarity — BGE-M3 cosine similarity against same-block candidates
+3. Semantic Similarity — DeepInfra BGE-M3 cosine similarity against same-block candidates
 4. Graph Context  — verify Neo4j neighbour structure to disambiguate collisions
 
 All stages now correctly wire together: Stage 2 builds a candidate map that is
 passed into Stage 3 for each entity resolution call.
 """
 
+import os
 import logging
 import re
 from typing import List, Tuple, Dict, Set
 
+from openai import AsyncOpenAI
 from logic_extractor import ExtractionResult, KnowledgeTriple
 from database_service import DatabaseService
 
@@ -26,22 +28,23 @@ logger = logging.getLogger("SentinelVault-EntityResolver")
 
 class EntityResolver:
     def __init__(self):
-        self.embedding_model = None
+        self.embedding_client = None
         self.models_loaded = False
 
     async def initialize_models(self):
         """
-        Loads the BGE-M3 embedding model for Semantic Similarity resolution.
-        This model instance is also shared with DatabaseService to avoid duplicate VRAM usage.
+        Initializes the DeepInfra OpenAI client used for embeddings.
         """
         if self.models_loaded:
             return
 
-        logger.info("Loading BGE-M3 model for Entity Resolution...")
-        from FlagEmbedding import BGEM3FlagModel
-        self.embedding_model = BGEM3FlagModel('BAAI/bge-m3', use_fp16=True)
+        logger.info("Initializing DeepInfra embedding client for Entity Resolution...")
+        self.embedding_client = AsyncOpenAI(
+            base_url="https://api.deepinfra.com/v1/openai",
+            api_key=os.getenv("DEEPINFRA_API_KEY")
+        )
         self.models_loaded = True
-        logger.info("BGE-M3 loaded successfully for EntityResolver.")
+        logger.info("EntityResolver embedding client ready.")
 
     async def resolve(
         self, extraction: ExtractionResult, db_service: DatabaseService
@@ -146,7 +149,7 @@ class EntityResolver:
         self, entity_name: str, candidates: List[str]
     ) -> str:
         """
-        Uses BGE-M3 cosine similarity to find the best matching candidate.
+        Uses DeepInfra BGE-M3 cosine similarity to find the best matching candidate.
         Returns the candidate if similarity exceeds 0.85, otherwise the original name.
         """
         if not candidates:
@@ -154,18 +157,29 @@ class EntityResolver:
 
         import numpy as np
 
-        entity_emb = self.embedding_model.encode([entity_name])['dense_vecs']
-        candidate_embs = self.embedding_model.encode(candidates)['dense_vecs']
+        try:
+            # Fetch embedding for target entity
+            resp = await self.embedding_client.embeddings.create(input=[entity_name], model="BAAI/bge-m3")
+            entity_emb = np.array(resp.data[0].embedding)
 
-        similarities = np.dot(candidate_embs, entity_emb.T).flatten()
-        best_idx = int(np.argmax(similarities))
+            # Fetch embeddings for candidates
+            resp_cands = await self.embedding_client.embeddings.create(input=candidates, model="BAAI/bge-m3")
+            candidate_embs = np.array([item.embedding for item in resp_cands.data])
 
-        if similarities[best_idx] > 0.85:
-            logger.debug(
-                f"Entity '{entity_name}' → merged with '{candidates[best_idx]}' "
-                f"(similarity={similarities[best_idx]:.3f})"
+            similarities = np.dot(candidate_embs, entity_emb)
+            best_idx = int(np.argmax(similarities))
+
+            if similarities[best_idx] > 0.85:
+                logger.debug(
+                    f"Entity '{entity_name}' → merged with '{candidates[best_idx]}' "
+                    f"(similarity={similarities[best_idx]:.3f})"
+                )
+                return candidates[best_idx]
+        except Exception as e:
+            logger.error(
+                f"_stage_3_semantic_similarity failed for entity '{entity_name}': {e}"
             )
-            return candidates[best_idx]
+            raise
 
         return entity_name
 
@@ -188,7 +202,10 @@ class EntityResolver:
             if results:
                 logger.debug(f"Found existing graph neighbours for '{entity_name}'.")
         except Exception as e:
-            logger.warning(f"Graph context check failed for '{entity_name}': {e}")
+            logger.error(
+                f"_stage_4_graph_context failed for entity '{entity_name}': {e}"
+            )
+            raise
 
         return entity_name
 
@@ -206,6 +223,18 @@ class EntityResolver:
         Runs Stages 3 and 4 for a single entity, using the candidate list
         built by Stage 2 (blocking).
         """
-        semantically_matched = await self._stage_3_semantic_similarity(entity_name, candidates)
-        contextually_matched = await self._stage_4_graph_context(semantically_matched, db_service)
+        try:
+            semantically_matched = await self._stage_3_semantic_similarity(entity_name, candidates)
+        except Exception as e:
+            raise RuntimeError(
+                f"Entity resolution Stage 3 (Semantic Similarity) failed for '{entity_name}': {e}"
+            ) from e
+
+        try:
+            contextually_matched = await self._stage_4_graph_context(semantically_matched, db_service)
+        except Exception as e:
+            raise RuntimeError(
+                f"Entity resolution Stage 4 (Graph Context) failed for '{semantically_matched}': {e}"
+            ) from e
+
         return contextually_matched

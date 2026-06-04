@@ -1,0 +1,37 @@
+services:
+  - type: web
+    name: sentinelvault-rag
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: OPENROUTER_BASE_URL
+        sync: false
+      - key: OPENROUTER_MODEL
+        sync: false
+      - key: DEEPINFRA_API_KEY
+        sync: false
+      - key: NEO4J_URI
+        sync: false
+      - key: NEO4J_USERNAME
+        sync: false
+      - key: NEO4J_PASSWORD
+        sync: false
+      - key: QDRANT_URL
+        sync: false
+      - key: QDRANT_API_KEY
+        sync: false
+      - key: HF_API_TOKEN
+        sync: false
+      - key: CHUNK_SIZE
+        value: "1500"
+      - key: CHUNK_OVERLAP
+        value: "150"
+      - key: GRAPH_QUERY_LIMIT
+        value: "50"
+      - key: MAX_SOURCES
+        value: "5"
+      - key: LEDGER_PATH
+        value: "/tmp/correction_ledger.jsonl"

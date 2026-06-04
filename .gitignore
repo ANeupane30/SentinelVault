@@ -2,6 +2,7 @@
 __pycache__
 research
 RAG/.env
+RAG/env_info.txt
 RAG/fw_models.json
 
 # Visual Studio

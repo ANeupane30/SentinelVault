@@ -2,9 +2,8 @@
 database_service.py
 
 Async transaction manager for Neo4j (Property Graph) and Qdrant (Vector DB).
-Handles local BGE-M3 embedding batches and maintains cross-links between
+Handles unified embeddings via DeepInfra and maintains cross-links between
 Neo4j Graph Node IDs and Qdrant Chunk IDs.
-Enforces real database connections; fails fast if Qdrant or Neo4j are offline.
 """
 
 import os
@@ -16,16 +15,14 @@ from typing import List, Dict, Any, Optional
 from neo4j import AsyncGraphDatabase
 from qdrant_client import AsyncQdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
+from openai import AsyncOpenAI
 
 from document_parser import ChunkMetadata
 
 logger = logging.getLogger("SentinelVault-Database")
 
-NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
-NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
 
-QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
+
 COLLECTION_NAME = "sentinel_chunks"
 VECTOR_DIM = 1024  # BGE-M3 dense vector dimensionality
 
@@ -34,39 +31,52 @@ class DatabaseService:
     def __init__(self):
         self.neo4j_driver = None
         self.qdrant_client = None
-        self.bge_model = None
+        self.embedding_client = None
 
-    async def initialize_models(self, shared_model=None):
+    async def initialize_models(self, shared_client=None):
         """
-        Loads the BGE-M3 embedding model used for vector generation.
-
-        Args:
-            shared_model: An already-loaded BGEM3FlagModel instance (from EntityResolver).
-                          When provided, it is reused directly to avoid loading BGE-M3 twice
-                          and wasting ~2 GB VRAM. If None, loads an independent instance.
+        Initializes the DeepInfra OpenAI client used for embeddings.
         """
-        if shared_model is not None:
-            logger.info("DatabaseService reusing shared BGE-M3 instance from EntityResolver.")
-            self.bge_model = shared_model
+        if shared_client is not None:
+            logger.info("DatabaseService reusing shared embedding client.")
+            self.embedding_client = shared_client
         else:
-            logger.info("Loading BGE-M3 independently for DatabaseService...")
-            from FlagEmbedding import BGEM3FlagModel
-            self.bge_model = BGEM3FlagModel('BAAI/bge-m3', use_fp16=True)
+            logger.info("Initializing DeepInfra embedding client...")
+            self.embedding_client = AsyncOpenAI(
+                base_url="https://api.deepinfra.com/v1/openai",
+                api_key=os.getenv("DEEPINFRA_API_KEY")
+            )
+        logger.info("DatabaseService embedding client ready.")
 
-        logger.info("DatabaseService BGE-M3 ready.")
+        # C5: Validate that the embedding model produces vectors matching VECTOR_DIM
+        logger.info("Validating embedding dimension against VECTOR_DIM...")
+        test_vector = await self._generate_embeddings("test")
+        if len(test_vector) != VECTOR_DIM:
+            raise RuntimeError(
+                f"Embedding dimension mismatch. Expected {VECTOR_DIM}, "
+                f"got {len(test_vector)}. Update VECTOR_DIM or check "
+                f"the embedding model."
+            )
+        logger.info(f"Embedding dimension validated: {len(test_vector)} == VECTOR_DIM ({VECTOR_DIM}).")
 
     async def connect(self):
         """
-        Establishes async connections to Neo4j and Qdrant.
+        Establishes async connections to cloud Neo4j and Qdrant.
         Creates the Qdrant collection if it does not already exist.
-        Fails fast if either database is unreachable.
         """
-        logger.info("Connecting to local Neo4j and Qdrant instances...")
+        logger.info("Connecting to cloud Neo4j and Qdrant instances...")
+        
+        neo4j_uri = os.getenv("NEO4J_URI")
+        neo4j_user = os.getenv("NEO4J_USER")
+        neo4j_password = os.getenv("NEO4J_PASSWORD")
+        qdrant_url = os.getenv("QDRANT_URL")
+        qdrant_api_key = os.getenv("QDRANT_API_KEY")
+
         try:
             self.neo4j_driver = AsyncGraphDatabase.driver(
-                NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD)
+                neo4j_uri, auth=(neo4j_user, neo4j_password)
             )
-            self.qdrant_client = AsyncQdrantClient(url=QDRANT_URL)
+            self.qdrant_client = AsyncQdrantClient(url=qdrant_url, api_key=qdrant_api_key)
 
             # Validate Qdrant is reachable
             collections = await self.qdrant_client.get_collections()
@@ -83,7 +93,7 @@ class DatabaseService:
         except Exception as e:
             raise RuntimeError(
                 f"Database connection failed: {str(e)}\n"
-                f"Ensure Neo4j is at {NEO4J_URI} and Qdrant is at {QDRANT_URL}."
+                f"Ensure NEO4J_URI and QDRANT_URL are configured properly."
             )
 
     async def disconnect(self):
@@ -96,16 +106,21 @@ class DatabaseService:
 
     async def _generate_embeddings(self, text: str) -> List[float]:
         """
-        Generates 1024-dim dense vectors using BGE-M3 locally.
+        Generates 1024-dim dense vectors using DeepInfra's BGE-M3 endpoint.
         """
-        assert self.bge_model is not None, (
-            "BGE-M3 model not loaded. Call initialize_models() before using DatabaseService."
+        assert self.embedding_client is not None, (
+            "Embedding client not loaded. Call initialize_models() before using DatabaseService."
         )
-        # BGE-M3 encode is CPU/GPU synchronous — offload to thread pool
-        emb = await asyncio.to_thread(
-            lambda: self.bge_model.encode([text])['dense_vecs'][0]
-        )
-        return emb.tolist()
+        try:
+            response = await self.embedding_client.embeddings.create(
+                input=[text],
+                model="BAAI/bge-m3",
+                encoding_format="float"
+            )
+            return response.data[0].embedding
+        except Exception as e:
+            logger.error(f"Embedding generation failed: {e}")
+            raise RuntimeError(f"Embedding generation failed: {e}") from e
 
     # -------------------------------------------------------------------------
     # Neo4j
@@ -150,14 +165,26 @@ class DatabaseService:
             async with self.neo4j_driver.session() as session:
                 result = await session.run(cypher_template, parameters)
                 records = await result.data()
-            return records
+            
+            filtered_records = []
+            for rec in records:
+                content_str = str(rec).strip() if rec else ""
+                if not content_str:
+                    continue
+                
+                # Assign deterministic source and content for the pipeline
+                rec["source"] = "Graph"
+                rec["content"] = content_str
+                
+                filtered_records.append(rec)
+                
+            return filtered_records
         except Exception as e:
             raise RuntimeError(f"Neo4j Graph Query failed: {str(e)}")
 
     async def prune_low_confidence_nodes(self, entity_name: str):
         """
         Deletes edges connected to the given entity whose confidence is below 0.3.
-        Called by AuditLogger when a user submits strong negative feedback for an entity.
         """
         logger.info(f"Pruning low-confidence edges for entity: '{entity_name}'")
         cypher = (
@@ -172,6 +199,59 @@ class DatabaseService:
         except Exception as e:
             logger.error(f"Graph pruning failed for '{entity_name}': {str(e)}")
             raise RuntimeError(f"Failed to prune graph for '{entity_name}': {str(e)}")
+
+    # -------------------------------------------------------------------------
+    # Document Registry
+    # -------------------------------------------------------------------------
+
+    async def upsert_document_node(self, document_id: str, source_filename: str, title: str, ingested_at: str, total_chunks: int):
+        """
+        Creates or updates a Document node in Neo4j representing an ingested file.
+        """
+        logger.info(f"Upserting Document node for {document_id} ({source_filename})")
+        cypher = (
+            "MERGE (d:Document {document_id: $document_id}) "
+            "SET d.source_filename = $source_filename, "
+            "d.title = $title, "
+            "d.ingested_at = $ingested_at, "
+            "d.total_chunks = $total_chunks"
+        )
+        parameters = {
+            "document_id": document_id,
+            "source_filename": source_filename,
+            "title": title,
+            "ingested_at": ingested_at,
+            "total_chunks": total_chunks
+        }
+        try:
+            async with self.neo4j_driver.session() as session:
+                await session.run(cypher, parameters)
+        except Exception as e:
+            logger.error(f"Failed to upsert Document node: {e}")
+            raise RuntimeError(f"Failed to upsert Document node: {e}")
+
+    async def get_all_documents(self) -> List[Dict[str, Any]]:
+        """
+        Retrieves all Document nodes from Neo4j, ordered by ingestion time descending.
+        """
+        logger.info("Fetching all ingested documents.")
+        cypher = (
+            "MATCH (d:Document) "
+            "RETURN d.document_id AS document_id, "
+            "d.source_filename AS source_filename, "
+            "d.title AS title, "
+            "d.ingested_at AS ingested_at, "
+            "d.total_chunks AS total_chunks "
+            "ORDER BY d.ingested_at DESC"
+        )
+        try:
+            async with self.neo4j_driver.session() as session:
+                result = await session.run(cypher)
+                records = await result.data()
+                return records
+        except Exception as e:
+            logger.error(f"Failed to fetch documents: {e}")
+            raise RuntimeError(f"Failed to fetch documents: {e}")
 
     # -------------------------------------------------------------------------
     # Qdrant
@@ -212,9 +292,23 @@ class DatabaseService:
                 query_vector=query_vector,
                 limit=limit,
             )
-            return [
-                {"source": "Vector", "content": r.payload.get("text", "")}
-                for r in results
-            ]
+            filtered_results = []
+            for r in results:
+                content = r.payload.get("text")
+                if not content or not str(content).strip():
+                    continue
+                
+                # Check for required metadata fields
+                required_fields = ["document_id", "estimated_page_number", "heading_depth", "section_path", "source_filename"]
+                if not all(field in r.payload for field in required_fields):
+                    continue
+                    
+                result_dict = {"source": "Vector", "content": str(content).strip()}
+                for k, v in r.payload.items():
+                    if k != "text":
+                        result_dict[k] = v
+                filtered_results.append(result_dict)
+                
+            return filtered_results
         except Exception as e:
             raise RuntimeError(f"Qdrant Vector Search failed: {str(e)}")
